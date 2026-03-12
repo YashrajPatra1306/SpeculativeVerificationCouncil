@@ -1,0 +1,30 @@
+## Build output
+bin/
+obj/
+
+## Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docview
+
+## Rider
+.idea/
+
+## VS Code
+.vscode/
+
+## NativeAOT intermediate files
+*.o
+*.s
+*.dwarf
+
+## Environment / secrets — NEVER commit your API key
+.env
+*.env.local
+secrets.json
+
+## OS junk
+Thumbs.db
+.DS_Store
