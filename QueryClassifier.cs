@@ -32,16 +32,16 @@ public sealed class QueryClassifier
         {
             string prompt = $$"""
                 Classify this query into exactly one category and assess urgency.
-                
+
                 Query: "{{query}}"
-                
+
                 Respond ONLY with valid JSON:
                 {
                   "intent": "math" | "research" | "code" | "creative" | "general",
                   "urgency": 1-10 (10 = extremely urgent),
                   "reasoning": "one sentence why"
                 }
-                
+
                 Categories:
                 - math: calculations, equations, proofs, statistics
                 - research: factual questions, history, science, analysis
@@ -136,11 +136,11 @@ public sealed class QueryClassifier
     private static QueryIntent ParseIntent(string? intent) =>
         intent?.ToLowerInvariant() switch
         {
-            "math" => QueryIntent.Math,
+            "math"     => QueryIntent.Math,
             "research" => QueryIntent.Research,
-            "code" => QueryIntent.Code,
+            "code"     => QueryIntent.Code,
             "creative" => QueryIntent.Creative,
-            _ => QueryIntent.General
+            _          => QueryIntent.General
         };
 
     private static ConsensusStrategy MapIntentToStrategy(QueryIntent intent, int urgency, string query)
@@ -152,11 +152,14 @@ public sealed class QueryClassifier
 
         return intent switch
         {
-            QueryIntent.Math => ConsensusStrategy.Strict,
+            QueryIntent.Math     => ConsensusStrategy.Strict,
             QueryIntent.Research => ConsensusStrategy.Strict,
-            QueryIntent.Code => ConsensusStrategy.Weighted,
+            QueryIntent.Code     => ConsensusStrategy.Weighted,
             QueryIntent.Creative => ConsensusStrategy.Adversarial,
-            _ => ConsensusStrategy.Weighted
+            // Fix (Bug 7): Urgent was returned by HeuristicClassify but not
+            // handled here, silently falling through to Weighted instead of Fast.
+            QueryIntent.Urgent   => ConsensusStrategy.Fast,
+            _                    => ConsensusStrategy.Weighted
         };
     }
 }
