@@ -23,7 +23,7 @@ public sealed class AdaptiveVerificationEngine : IDisposable
     ];
 
     private static readonly TimeSpan CouncilTimeout = TimeSpan.FromSeconds(30);
-    
+
     // Security: Rate limiting to prevent DoS and resource exhaustion
     private readonly RateLimiter _rateLimiter;
     private const int MaxConcurrentRequests = 5;
@@ -94,7 +94,7 @@ public sealed class AdaptiveVerificationEngine : IDisposable
             return CreateFallbackReport(query, "", ConsensusStrategy.Weighted, QueryIntent.Unknown, totalSw.Elapsed,
                 "Empty query not allowed");
         }
-        
+
         // Security: Enforce maximum query length
         const int MaxQueryLength = 5000;
         if (query.Length > MaxQueryLength)
@@ -227,79 +227,89 @@ public sealed class AdaptiveVerificationEngine : IDisposable
         var aggregator = new VoteAggregator();
 
         // Security: Acquire rate limit permit before proceeding
+        // Fix (Bug 4): throw instead of silently continuing when rate limit is exceeded
         using var lease = await _rateLimiter.AcquireAsync(1, ct);
         if (!lease.IsAcquired)
-        {
-            onStatus?.Invoke("Rate limit exceeded — request queued");
-        }
+            throw new InvalidOperationException("Rate limit exceeded — too many concurrent requests. Please try again shortly.");
 
-        // Launch all verifications in parallel with controlled concurrency
-        var tasks = CouncilModels.Select(m =>
-            _client.VerifyAsync(m.Model, draft, query, m.Weight, CouncilTimeout, ct))
-            .ToList();
-
-        // Wait for all with overall timeout (give extra buffer beyond individual timeout)
         try
         {
-            var overallTimeout = Task.Delay(CouncilTimeout + TimeSpan.FromSeconds(2), ct);
-            var allTasks = Task.WhenAll(tasks);
+            // Fix (Bug 3): build an indexed list of (model, task) pairs so we never
+            // rely on List<Task>.IndexOf(), which uses reference equality and can
+            // return -1 if the task object isn't found, causing an IndexOutOfRangeException.
+            var indexedTasks = CouncilModels
+                .Select((m, i) => (Model: m, Task: _client.VerifyAsync(m.Model, draft, query, m.Weight, CouncilTimeout, ct)))
+                .ToList();
 
-            var completed = await Task.WhenAny(allTasks, overallTimeout);
+            var tasks = indexedTasks.Select(x => x.Task).ToList();
 
-            if (completed == allTasks)
+            // Wait for all with overall timeout (give extra buffer beyond individual timeout)
+            try
             {
-                // All completed within timeout
-                foreach (var vote in await allTasks)
+                var overallTimeout = Task.Delay(CouncilTimeout + TimeSpan.FromSeconds(2), ct);
+                var allTasks = Task.WhenAll(tasks);
+
+                var completed = await Task.WhenAny(allTasks, overallTimeout);
+
+                if (completed == allTasks)
                 {
-                    aggregator.Add(vote);
-                    onStatus?.Invoke($"  {vote.ModelName}: {(vote.TimedOut ? "TIMEOUT" : vote.Error ?? (vote.Result.Valid ? "✓ VALID" : "✗ INVALID"))} ({vote.ResponseTime.TotalSeconds:F1}s)");
-                }
-            }
-            else
-            {
-                // Overall timeout hit — collect whatever finished
-                onStatus?.Invoke("Council overall timeout — collecting partial results...");
-                foreach (var task in tasks)
-                {
-                    if (task.IsCompletedSuccessfully)
+                    // All completed within timeout
+                    foreach (var vote in await allTasks)
                     {
-                        var vote = await task;
                         aggregator.Add(vote);
-                        onStatus?.Invoke($"  {vote.ModelName}: {(vote.Result.Valid ? "✓" : "✗")} ({vote.ResponseTime.TotalSeconds:F1}s)");
+                        onStatus?.Invoke($"  {vote.ModelName}: {(vote.TimedOut ? "TIMEOUT" : vote.Error ?? (vote.Result.Valid ? "✓ VALID" : "✗ INVALID"))} ({vote.ResponseTime.TotalSeconds:F1}s)");
                     }
-                    else
+                }
+                else
+                {
+                    // Overall timeout hit — collect whatever finished
+                    onStatus?.Invoke("Council overall timeout — collecting partial results...");
+                    foreach (var (modelInfo, task) in indexedTasks)
                     {
-                        // Create a timeout vote for tasks that didn't finish
-                        var modelInfo = CouncilModels[tasks.IndexOf(task)];
-                        aggregator.Add(new CouncilVote(
-                            modelInfo.Model, modelInfo.Weight,
-                            new VerificationResult(),
-                            CouncilTimeout, TimedOut: true));
+                        if (task.IsCompletedSuccessfully)
+                        {
+                            var vote = await task;
+                            aggregator.Add(vote);
+                            onStatus?.Invoke($"  {vote.ModelName}: {(vote.Result.Valid ? "✓" : "✗")} ({vote.ResponseTime.TotalSeconds:F1}s)");
+                        }
+                        else
+                        {
+                            // Create a timeout vote for tasks that didn't finish
+                            // Safe: modelInfo is already associated with this task — no IndexOf needed
+                            aggregator.Add(new CouncilVote(
+                                modelInfo.Model, modelInfo.Weight,
+                                new VerificationResult(),
+                                CouncilTimeout, TimedOut: true));
+                        }
                     }
                 }
             }
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            // Timeout — degrade gracefully
-            onStatus?.Invoke("Council timeout — proceeding with available votes");
-        }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                // Timeout — degrade gracefully
+                onStatus?.Invoke("Council timeout — proceeding with available votes");
+            }
 
-        // Deadlock fallback: if zero valid responses, create a synthetic local vote
-        if (aggregator.ValidResponseCount == 0)
-        {
-            onStatus?.Invoke("Council deadlock — falling back to local model completion");
-            aggregator.Add(new CouncilVote(
-                "local-fallback", 1.0,
-                new VerificationResult(
-                    Valid: true,
-                    Corrections: [],
-                    Facts: [draft],
-                    Confidence: 0.3),
-                TimeSpan.Zero));
-        }
+            // Deadlock fallback: if zero valid responses, create a synthetic local vote
+            if (aggregator.ValidResponseCount == 0)
+            {
+                onStatus?.Invoke("Council deadlock — falling back to local model completion");
+                aggregator.Add(new CouncilVote(
+                    "local-fallback", 1.0,
+                    new VerificationResult(
+                        Valid: true,
+                        Corrections: [],
+                        Facts: [draft],
+                        Confidence: 0.3),
+                    TimeSpan.Zero));
+            }
 
-        return aggregator;
+            return aggregator;
+        }
+        finally
+        {
+            _rateLimiter.Dispose();
+        }
     }
 
     /// <summary>
@@ -380,7 +390,7 @@ public sealed class AdaptiveVerificationEngine : IDisposable
             │  API Calls:     {cost.TotalApiCalls,-10}                 │
             │  Local Tokens:  {cost.LocalTokens,-10}                   │
             │  Cloud Tokens:  {cost.CloudTokens,-10}                   │
-            │  Est. Cost:     ${cost.EstimatedCostUsd:F4}              |                │
+            │  Est. Cost:     ${cost.EstimatedCostUsd:F4}              │
             └──────────────────────────────────────────────────────────┘
             """;
     }
