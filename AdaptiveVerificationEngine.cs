@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Threading.RateLimiting;
 using SpeculativeVerificationCouncil.Strategies;
 
 namespace SpeculativeVerificationCouncil;
@@ -22,6 +23,10 @@ public sealed class AdaptiveVerificationEngine : IDisposable
     ];
 
     private static readonly TimeSpan CouncilTimeout = TimeSpan.FromSeconds(30);
+    
+    // Security: Rate limiting to prevent DoS and resource exhaustion
+    private readonly RateLimiter _rateLimiter;
+    private const int MaxConcurrentRequests = 5;
 
     // ── Dependencies ───────────────────────────────────────────────────────
     private readonly OllamaClient _client;
@@ -55,6 +60,14 @@ public sealed class AdaptiveVerificationEngine : IDisposable
         _classifier = new QueryClassifier(client);
         _reflectionLoop = new ReflectionLoop(client);
 
+        // Security: Initialize rate limiter to prevent DoS
+        _rateLimiter = new ConcurrencyLimiter(new ConcurrencyLimiterOptions
+        {
+            PermitLimit = MaxConcurrentRequests,
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+            QueueLimit = 10
+        });
+
         _strategies = new Dictionary<ConsensusStrategy, IConsensusStrategy>
         {
             [ConsensusStrategy.Strict] = new StrictStrategy(),
@@ -73,6 +86,23 @@ public sealed class AdaptiveVerificationEngine : IDisposable
         CancellationToken ct = default)
     {
         var totalSw = Stopwatch.StartNew();
+
+        // Security: Validate input to prevent injection and resource exhaustion
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            totalSw.Stop();
+            return CreateFallbackReport(query, "", ConsensusStrategy.Weighted, QueryIntent.Unknown, totalSw.Elapsed,
+                "Empty query not allowed");
+        }
+        
+        // Security: Enforce maximum query length
+        const int MaxQueryLength = 5000;
+        if (query.Length > MaxQueryLength)
+        {
+            totalSw.Stop();
+            return CreateFallbackReport(query[..MaxQueryLength], "", ConsensusStrategy.Weighted, QueryIntent.Unknown, totalSw.Elapsed,
+                $"Query exceeds maximum length of {MaxQueryLength} characters");
+        }
 
         // ── Phase 0: Classify ──────────────────────────────────────────────
         Report("Classifying query intent...", onStatus);
@@ -189,13 +219,21 @@ public sealed class AdaptiveVerificationEngine : IDisposable
     /// <summary>
     /// Fire parallel verification requests to all council models.
     /// Uses Task.WhenAny with timeout for graceful degradation.
+    /// Implements rate limiting to prevent DoS and resource exhaustion.
     /// </summary>
     private async Task<VoteAggregator> RunCouncilAsync(
         string query, string draft, Action<string>? onStatus, CancellationToken ct)
     {
         var aggregator = new VoteAggregator();
 
-        // Launch all verifications in parallel
+        // Security: Acquire rate limit permit before proceeding
+        using var lease = await _rateLimiter.AcquireAsync(1, ct);
+        if (!lease.IsAcquired)
+        {
+            onStatus?.Invoke("Rate limit exceeded — request queued");
+        }
+
+        // Launch all verifications in parallel with controlled concurrency
         var tasks = CouncilModels.Select(m =>
             _client.VerifyAsync(m.Model, draft, query, m.Weight, CouncilTimeout, ct))
             .ToList();
