@@ -24,13 +24,13 @@ public sealed class OllamaClient : IDisposable
     // Security: URL validation pattern to prevent SSRF
     private static readonly Regex ValidUrlPattern = new(
         @"^https?://", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    
+
     // Security: Allowed hosts for local and cloud endpoints
     private static readonly HashSet<string> AllowedLocalHosts = new(StringComparer.OrdinalIgnoreCase)
     {
         "localhost", "127.0.0.1", "::1"
     };
-    
+
     private static readonly HashSet<string> AllowedCloudHosts = new(StringComparer.OrdinalIgnoreCase)
     {
         "api.ollama.com", "ollama.com"
@@ -47,7 +47,7 @@ public sealed class OllamaClient : IDisposable
         // Security: Validate and sanitize URLs to prevent SSRF
         localBaseUrl = ValidateAndSanitizeUrl(localBaseUrl, AllowedLocalHosts, "local");
         cloudBaseUrl = ValidateAndSanitizeUrl(cloudBaseUrl, AllowedCloudHosts, "cloud");
-        
+
         _apiKey = apiKey ?? Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
 
         _localClient = new HttpClient(new SocketsHttpHandler
@@ -78,45 +78,31 @@ public sealed class OllamaClient : IDisposable
                 new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _apiKey);
         }
     }
-    
+
     /// <summary>
     /// Security: Validate URL scheme and host against allowlist to prevent SSRF attacks.
     /// </summary>
     private static string ValidateAndSanitizeUrl(string url, HashSet<string> allowedHosts, string endpointType)
     {
         if (string.IsNullOrWhiteSpace(url))
-        {
             throw new ArgumentException($"{endpointType} URL cannot be empty", nameof(url));
-        }
 
-        // Validate URL scheme
         if (!ValidUrlPattern.IsMatch(url))
-        {
             throw new ArgumentException(
                 $"{endpointType} URL must use http:// or https:// scheme", nameof(url));
-        }
 
-        // Parse and validate host
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
-        {
             throw new ArgumentException(
                 $"{endpointType} URL is not a valid absolute URI", nameof(url));
-        }
 
-        // Check host against allowlist
         if (!allowedHosts.Contains(uri.Host))
-        {
             throw new ArgumentException(
                 $"{endpointType} URL host '{uri.Host}' is not in the allowed list. " +
                 $"Allowed hosts: {string.Join(", ", allowedHosts)}", nameof(url));
-        }
 
-        // Ensure no suspicious query parameters or fragments
         if (!string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment))
-        {
             throw new ArgumentException(
                 $"{endpointType} URL should not contain query parameters or fragments", nameof(url));
-        }
 
         return url;
     }
@@ -202,21 +188,86 @@ public sealed class OllamaClient : IDisposable
     }
 
     /// <summary>
+    /// Send a chat completion request to Ollama (local or cloud).
+    /// </summary>
+    public async Task<ChatResponse?> ChatAsync(
+        string model,
+        ChatMessage[] messages,
+        float temperature = 0.7f,
+        string[]? tools = null,
+        bool enableThinking = false,
+        CancellationToken ct = default)
+    {
+        bool isCloud = model.Contains("cloud", StringComparison.OrdinalIgnoreCase);
+        var chatRequest = new ChatRequest(
+            Model: model,
+            Messages: messages,
+            Stream: false,
+            Options: new ChatOptions(Temperature: temperature),
+            Tools: tools ?? Array.Empty<string>(),
+            Think: enableThinking
+        );
+
+        var client = isCloud ? _cloudClient : _localClient;
+
+        for (int attempt = 1; attempt <= MaxRetries + 1; attempt++)
+        {
+            try
+            {
+                var jsonBytes = JsonSerializer.SerializeToUtf8Bytes(
+                    chatRequest, AppJsonContext.Default.ChatRequest);
+
+                using var content = new ByteArrayContent(jsonBytes);
+                content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+
+                using var response = await client.PostAsync("/api/chat", content, ct);
+                response.EnsureSuccessStatusCode();
+
+                var stream = await response.Content.ReadAsStreamAsync(ct);
+                var result = await JsonSerializer.DeserializeAsync(
+                    stream, AppJsonContext.Default.ChatResponse, ct);
+
+                if (result is not null)
+                {
+                    int tokens = result.EvalCount + result.PromptEvalCount;
+                    if (isCloud)
+                        Interlocked.Add(ref _totalCloudTokens, tokens);
+                    else
+                        Interlocked.Add(ref _totalLocalTokens, tokens);
+
+                    Interlocked.Increment(ref _totalApiCalls);
+                }
+
+                return result;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception) when (attempt <= MaxRetries)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(100 * attempt), ct);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Security: Sanitize user input to prevent prompt injection attacks.
-    /// Escapes special characters and removes potentially malicious patterns.
+    /// Removes known hijack patterns; does NOT escape backslashes or quotes
+    /// because inputs are embedded in raw string literals ($$""") which need
+    /// no escaping — adding it caused the model to receive literal \" sequences.
+    /// Fix (Bug 5): removed .Replace("\\", "\\\\") and .Replace("\"", "\\\"").
     /// </summary>
     private static string SanitizePromptInput(string input)
     {
         if (string.IsNullOrEmpty(input))
             return string.Empty;
-        
-        // Remove or escape common prompt injection patterns
+
+        // Remove common instruction patterns that could hijack the model
         var sanitized = input
-            // Replace backslashes to prevent escape sequences
-            .Replace("\\", "\\\\")
-            // Replace quotes to prevent breaking out of strings
-            .Replace("\"", "\\\"")
-            // Remove common instruction patterns that could hijack the model
             .Replace("Ignore previous", "[FILTERED]")
             .Replace("ignore previous", "[FILTERED]")
             .Replace(" disregard", "[FILTERED]")
@@ -227,12 +278,12 @@ public sealed class OllamaClient : IDisposable
             .Replace("system:", "[FILTERED]")
             .Replace("### Instruction", "[FILTERED]")
             .Replace("### instruction", "[FILTERED]");
-        
+
         // Truncate excessively long inputs to prevent buffer/resource exhaustion
         const int MaxInputLength = 10000;
         if (sanitized.Length > MaxInputLength)
             sanitized = sanitized[..MaxInputLength] + "...[TRUNCATED]";
-        
+
         return sanitized;
     }
 
@@ -335,15 +386,12 @@ public sealed class OllamaClient : IDisposable
 
         var text = StripMarkdownFences(raw.Trim());
 
-        // Get the appropriate JsonTypeInfo from our source-generated context
         var typeInfo = GetTypeInfo<T>();
         if (typeInfo is null) return null;
 
-        // Try direct parse first
         if (TryDeserialize(text, typeInfo, out var result))
             return result;
 
-        // Try to extract JSON object from surrounding text
         int braceStart = text.IndexOf('{');
         int braceEnd = text.LastIndexOf('}');
         if (braceStart >= 0 && braceEnd > braceStart)
@@ -383,12 +431,8 @@ public sealed class OllamaClient : IDisposable
         }
     }
 
-    /// <summary>
-    /// Resolves the JsonTypeInfo for supported types from our AOT-safe source-generated context.
-    /// </summary>
     private static System.Text.Json.Serialization.Metadata.JsonTypeInfo<T>? GetTypeInfo<T>()
     {
-        // NativeAOT-compatible: resolve from source-generated context
         if (typeof(T) == typeof(VerificationResult))
             return (System.Text.Json.Serialization.Metadata.JsonTypeInfo<T>)(object)
                 LenientJsonContext.Default.VerificationResult;
