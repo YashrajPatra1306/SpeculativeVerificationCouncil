@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace SpeculativeVerificationCouncil;
 
@@ -20,6 +21,21 @@ public sealed class OllamaClient : IDisposable
     private int _totalCloudTokens;
     private int _totalApiCalls;
 
+    // Security: URL validation pattern to prevent SSRF
+    private static readonly Regex ValidUrlPattern = new(
+        @"^https?://", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    
+    // Security: Allowed hosts for local and cloud endpoints
+    private static readonly HashSet<string> AllowedLocalHosts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "localhost", "127.0.0.1", "::1"
+    };
+    
+    private static readonly HashSet<string> AllowedCloudHosts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "api.ollama.com", "ollama.com"
+    };
+
     public int TotalLocalTokens => _totalLocalTokens;
     public int TotalCloudTokens => _totalCloudTokens;
     public int TotalApiCalls => _totalApiCalls;
@@ -28,6 +44,10 @@ public sealed class OllamaClient : IDisposable
                          string cloudBaseUrl = "https://api.ollama.com",
                          string? apiKey = null)
     {
+        // Security: Validate and sanitize URLs to prevent SSRF
+        localBaseUrl = ValidateAndSanitizeUrl(localBaseUrl, AllowedLocalHosts, "local");
+        cloudBaseUrl = ValidateAndSanitizeUrl(cloudBaseUrl, AllowedCloudHosts, "cloud");
+        
         _apiKey = apiKey ?? Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
 
         _localClient = new HttpClient(new SocketsHttpHandler
@@ -57,6 +77,48 @@ public sealed class OllamaClient : IDisposable
             _cloudClient.DefaultRequestHeaders.Authorization =
                 new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _apiKey);
         }
+    }
+    
+    /// <summary>
+    /// Security: Validate URL scheme and host against allowlist to prevent SSRF attacks.
+    /// </summary>
+    private static string ValidateAndSanitizeUrl(string url, HashSet<string> allowedHosts, string endpointType)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            throw new ArgumentException($"{endpointType} URL cannot be empty", nameof(url));
+        }
+
+        // Validate URL scheme
+        if (!ValidUrlPattern.IsMatch(url))
+        {
+            throw new ArgumentException(
+                $"{endpointType} URL must use http:// or https:// scheme", nameof(url));
+        }
+
+        // Parse and validate host
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            throw new ArgumentException(
+                $"{endpointType} URL is not a valid absolute URI", nameof(url));
+        }
+
+        // Check host against allowlist
+        if (!allowedHosts.Contains(uri.Host))
+        {
+            throw new ArgumentException(
+                $"{endpointType} URL host '{uri.Host}' is not in the allowed list. " +
+                $"Allowed hosts: {string.Join(", ", allowedHosts)}", nameof(url));
+        }
+
+        // Ensure no suspicious query parameters or fragments
+        if (!string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment))
+        {
+            throw new ArgumentException(
+                $"{endpointType} URL should not contain query parameters or fragments", nameof(url));
+        }
+
+        return url;
     }
 
     /// <summary>
@@ -140,6 +202,41 @@ public sealed class OllamaClient : IDisposable
     }
 
     /// <summary>
+    /// Security: Sanitize user input to prevent prompt injection attacks.
+    /// Escapes special characters and removes potentially malicious patterns.
+    /// </summary>
+    private static string SanitizePromptInput(string input)
+    {
+        if (string.IsNullOrEmpty(input))
+            return string.Empty;
+        
+        // Remove or escape common prompt injection patterns
+        var sanitized = input
+            // Replace backslashes to prevent escape sequences
+            .Replace("\\", "\\\\")
+            // Replace quotes to prevent breaking out of strings
+            .Replace("\"", "\\\"")
+            // Remove common instruction patterns that could hijack the model
+            .Replace("Ignore previous", "[FILTERED]")
+            .Replace("ignore previous", "[FILTERED]")
+            .Replace(" disregard", "[FILTERED]")
+            .Replace("Disregard", "[FILTERED]")
+            .Replace("You are now", "[FILTERED]")
+            .Replace("you are now", "[FILTERED]")
+            .Replace("System:", "[FILTERED]")
+            .Replace("system:", "[FILTERED]")
+            .Replace("### Instruction", "[FILTERED]")
+            .Replace("### instruction", "[FILTERED]");
+        
+        // Truncate excessively long inputs to prevent buffer/resource exhaustion
+        const int MaxInputLength = 10000;
+        if (sanitized.Length > MaxInputLength)
+            sanitized = sanitized[..MaxInputLength] + "...[TRUNCATED]";
+        
+        return sanitized;
+    }
+
+    /// <summary>
     /// Send a verification request and parse the structured JSON response.
     /// Falls back gracefully if the model returns malformed JSON.
     /// </summary>
@@ -154,11 +251,15 @@ public sealed class OllamaClient : IDisposable
         bool isCloud = model.Contains("cloud", StringComparison.OrdinalIgnoreCase);
         var sw = Stopwatch.StartNew();
 
+        // Security: Sanitize user inputs to prevent prompt injection
+        string sanitizedQuery = SanitizePromptInput(originalQuery);
+        string sanitizedDraft = SanitizePromptInput(draft);
+
         string prompt = $$"""
             You are a verification model. Analyze the following draft response for accuracy.
 
-            Original question: {{originalQuery}}
-            Draft response: {{draft}}
+            Original question: {{sanitizedQuery}}
+            Draft response: {{sanitizedDraft}}
 
             Evaluate the draft and respond ONLY with valid JSON (no markdown, no explanation):
             {

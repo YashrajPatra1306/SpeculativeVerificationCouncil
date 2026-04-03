@@ -1,111 +1,104 @@
-# SpeculativeVerificationCouncil
+# Verification Council - Multi-Model Consensus Engine
 
-A fully cloud-powered LLM agent architecture implementing a **Draft → Verify → Render** pipeline with parallel model council verification. All models run via Ollama cloud — no local model downloads required.
+A high-performance LLM verification system using speculative decoding principles with multiple AI models.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  User Query                                                          │
-│     ↓                                                                │
-│  [QueryClassifier] ── gpt-oss:120b-cloud ── auto-select strategy    │
-│     ↓                                                                │
-│  [Cloud Draft] ── gpt-oss:120b-cloud (temp=0.9, 200 tokens)        │
-│     ↓                                                                │
-│  [Verification Council] ── 3 parallel cloud requests (8s timeout)   │
-│     ├── deepseek-v3.1:671b  (weight 2.0x, logic/reasoning)         │
-│     ├── qwen3-coder:480b    (weight 1.5x, technical/code)          │
-│     └── glm-4.6             (weight 1.0x, context/coherence)       │
-│     ↓                                                                │
-│  [Consensus Engine] ── Strategy Pattern (4 strategies)              │
-│     ├── Strict:      Intersection (all must agree)                  │
-│     ├── Weighted:    Union with >50% weighted threshold             │
-│     ├── Adversarial: Contradiction detection + cloud arbiter        │
-│     └── Fast:        Single fastest response (failover)             │
-│     ↓                                                                │
-│  [Reflection Loop] ── if confidence < 0.6, re-draft (max 2 iters)  │
-│     ↓                                                                │
-│  [Cloud Render] ── minimax-m2:cloud (structured fact injection)     │
-│     ↓                                                                │
-│  Final Verified Response                                             │
-└──────────────────────────────────────────────────────────────────────┘
+┌─────────────┐    ┌──────────────┐    ┌─────────────┐    ┌─────────────┐
+│   Classify  │ →  │    Draft     │ →  │   Verify    │ →  │   Render    │
+│  (Intent)   │    │  (Local LLM) │    │  (Council)  │    │  (Final)    │
+└─────────────┘    └──────────────┘    └─────────────┘    └─────────────┘
+                         │                   │
+                         │              ┌────┴────┐
+                         │              │Reflect? │
+                         │              └────┬────┘
+                         │                   │
+                         └───────────────────┘
 ```
 
-## Requirements
+## Features
 
-- **.NET 10 SDK** (preview) — or .NET 9 SDK (change `net10.0` to `net9.0` in `.csproj`)
-- **Ollama** running with the following cloud models pulled:
-  - `gpt-oss:120b-cloud` (draft, classification, reflection)
-  - `deepseek-v3.1:671b-cloud` (council — logic/reasoning)
-  - `qwen3-coder:480b-cloud` (council — technical/code)
-  - `glm-4.6:cloud` (council — context/coherence)
-  - `minimax-m2:cloud` (final rendering)
-- **OLLAMA_API_KEY** environment variable required for all cloud models
+- **Multi-Model Verification**: Parallel validation by 3+ LLMs (DeepSeek, Qwen, GLM)
+- **Consensus Strategies**: Strict, Weighted, Adversarial, Fast, Auto
+- **Reflection Loop**: Auto-correction when confidence is low
+- **Security Hardened**: SSRF prevention, prompt injection filtering, rate limiting
+- **NativeAOT Ready**: Source-generated JSON parsing, zero-allocation hot paths
+- **Cloud Integration**: TOON format (30-40% token reduction), Supabase storage, HF Spaces deployment
 
-## Build
+## Quick Start
 
-### Debug (JIT)
 ```bash
-dotnet build -c Debug
+# Set environment variables
+export OLLAMA_API_KEY="your-api-key"
+export OLLAMA_CLOUD_URL="https://api.ollama.com"
+
+# Run
 dotnet run
 ```
 
-### Release (NativeAOT — single executable)
-```bash
-# Windows x64
-dotnet publish -c Release -r win-x64 -p:PublishAot=true
+## Commands
 
-# Linux x64
-dotnet publish -c Release -r linux-x64 -p:PublishAot=true
-```
+| Command | Description |
+|---------|-------------|
+| `!strict` | All models must agree |
+| `!weighted` | >50% weighted score threshold |
+| `!adversarial` | Contradiction detection + arbiter |
+| `!fast` | Single fastest response |
+| `!auto` | Auto-select strategy per query |
+| `!details` | Toggle detailed metrics view (default: minimal) |
+| `!status` | Show engine status |
+| `exit` | Quit application |
 
-Output: `bin/Release/net10.0/<rid>/publish/SpeculativeVerificationCouncil` (single .exe, <20MB)
+## UX Features
+
+- **Minimal Output by Default**: Shows only answer and confidence score
+- **Toggle Detailed View**: Use `!details` to see metrics, votes, costs
+- **Clean Interface**: No clutter from tokens, latency, or cost info unless requested
+- **Color-Coded Confidence**: Green (>70%), Yellow (>40%), Red (<40%)
 
 ## Configuration
 
-| Variable            | Default                      | Description                    |
-|---------------------|------------------------------|--------------------------------|
-| `OLLAMA_API_KEY`    | (none)                       | API key for Ollama cloud       |
-| `OLLAMA_LOCAL_URL`  | `http://localhost:11434`     | Local Ollama endpoint          |
-| `OLLAMA_CLOUD_URL`  | `https://api.ollama.com`     | Cloud Ollama endpoint          |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_LOCAL_URL` | `http://localhost:11434` | Local Ollama endpoint |
+| `OLLAMA_CLOUD_URL` | `https://api.ollama.com` | Cloud Ollama endpoint |
+| `OLLAMA_API_KEY` | (none) | API key for cloud models |
+| `SUPABASE_URL` | (none) | Supabase PostgreSQL URL |
+| `SUPABASE_KEY` | (none) | Supabase API key |
+| `HF_SPACE_URL` | (none) | Hugging Face Space URL |
 
-## CLI Commands
-
-| Command         | Effect                                                      |
-|-----------------|-------------------------------------------------------------|
-| `!strict`       | Switch to Strict strategy (intersection consensus)          |
-| `!weighted`     | Switch to Weighted strategy (union with threshold)          |
-| `!adversarial`  | Switch to Adversarial strategy (contradiction + arbiter)    |
-| `!fast`         | Switch to Fast strategy (single fastest response)           |
-| `!auto`         | Auto-select strategy per query via gpt-oss:120b classifier  |
-| `!status`       | Show engine status, token counts, and estimated cost        |
-| `exit`          | Quit the application                                        |
-
-## File Structure
+## Project Structure
 
 ```
-SpeculativeVerificationCouncil/
-├── Program.cs                          # CLI entry, REPL loop, rich display
-├── AdaptiveVerificationEngine.cs       # Main Draft→Verify→Render orchestrator
-├── IConsensusStrategy.cs               # Strategy pattern interface
-├── Strategies/
-│   ├── StrictStrategy.cs               # Intersection consensus
-│   ├── WeightedStrategy.cs             # Weighted union consensus
-│   ├── AdversarialStrategy.cs          # Contradiction detection + arbiter
-│   └── FastStrategy.cs                 # Single fastest response
-├── QueryClassifier.cs                  # Cloud intent detection (gpt-oss:120b)
-├── OllamaClient.cs                     # Typed HTTP client (local + cloud)
-├── ConsensusReport.cs                  # Data models + JSON source generators
-├── VerificationVote.cs                 # Vote aggregation + Levenshtein dedup
-├── ReflectionLoop.cs                   # Iterative improvement handler
-└── SpeculativeVerificationCouncil.csproj
+/workspace/
+├── Program.cs                  # CLI entry point
+├── OllamaClient.cs             # HTTP client for Ollama API
+├── AdaptiveVerificationEngine.cs  # Main orchestrator
+├── QueryClassifier.cs          # Intent classification
+├── ReflectionLoop.cs           # Auto-correction loop
+├── ConsensusReport.cs          # Report data structure
+├── VerificationVote.cs         # Vote aggregation
+├── IConsensusStrategy.cs       # Strategy interface
+├── ToonConverter.cs            # JSON↔TOON conversion
+├── SupabaseClient.cs           # Database storage
+├── CloudDeploymentConfig.cs    # HF Spaces management
+├── N8nWorkflowGenerator.cs     # n8n workflow generation
+└── Strategies/
+    ├── StrictStrategy.cs
+    ├── WeightedStrategy.cs
+    ├── AdversarialStrategy.cs
+    └── FastStrategy.cs
 ```
 
-## Key Design Decisions
+## Security Features
 
-- **Zero external dependencies** — only .NET SDK base libraries
-- **NativeAOT-safe JSON** — `System.Text.Json` source generators (no reflection)
-- **ArrayPool buffer reuse** — minimizes GC pressure on the HTTP hot path
-- **Levenshtein deduplication** — fuzzy-matches near-duplicate facts across models
-- **Graceful degradation** — timeouts, parse failures, and network errors all have fallback paths
-- **CancellationToken everywhere** — responsive Ctrl+C handling at every async boundary
+- **SSRF Prevention**: URL allowlisting for endpoints
+- **Prompt Injection Filtering**: Input sanitization before LLM calls
+- **Rate Limiting**: Max 5 concurrent requests to prevent DoS
+- **Input Validation**: Length limits, empty checks
+- **Information Disclosure Reduction**: Generic model type mapping
+
+## License
+
+MIT
