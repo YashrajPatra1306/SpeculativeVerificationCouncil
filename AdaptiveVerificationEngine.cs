@@ -226,90 +226,85 @@ public sealed class AdaptiveVerificationEngine : IDisposable
     {
         var aggregator = new VoteAggregator();
 
-        // Security: Acquire rate limit permit before proceeding
-        // Fix (Bug 4): throw instead of silently continuing when rate limit is exceeded
+        // Security: Acquire rate limit permit before proceeding.
+        // Fix (Bug 4): throw instead of silently continuing when rate limit is exceeded.
+        // NOTE: Only the lease is disposed here — _rateLimiter is a class-level field
+        // and is only disposed in the IDisposable.Dispose() method below.
         using var lease = await _rateLimiter.AcquireAsync(1, ct);
         if (!lease.IsAcquired)
             throw new InvalidOperationException("Rate limit exceeded — too many concurrent requests. Please try again shortly.");
 
+        // Fix (Bug 3): build an indexed list of (model, task) pairs so we never
+        // rely on List<Task>.IndexOf(), which uses reference equality and can
+        // return -1 if the task object isn't found, causing an IndexOutOfRangeException.
+        var indexedTasks = CouncilModels
+            .Select((m, i) => (Model: m, Task: _client.VerifyAsync(m.Model, draft, query, m.Weight, CouncilTimeout, ct)))
+            .ToList();
+
+        var tasks = indexedTasks.Select(x => x.Task).ToList();
+
+        // Wait for all with overall timeout (give extra buffer beyond individual timeout)
         try
         {
-            // Fix (Bug 3): build an indexed list of (model, task) pairs so we never
-            // rely on List<Task>.IndexOf(), which uses reference equality and can
-            // return -1 if the task object isn't found, causing an IndexOutOfRangeException.
-            var indexedTasks = CouncilModels
-                .Select((m, i) => (Model: m, Task: _client.VerifyAsync(m.Model, draft, query, m.Weight, CouncilTimeout, ct)))
-                .ToList();
+            var overallTimeout = Task.Delay(CouncilTimeout + TimeSpan.FromSeconds(2), ct);
+            var allTasks = Task.WhenAll(tasks);
 
-            var tasks = indexedTasks.Select(x => x.Task).ToList();
+            var completed = await Task.WhenAny(allTasks, overallTimeout);
 
-            // Wait for all with overall timeout (give extra buffer beyond individual timeout)
-            try
+            if (completed == allTasks)
             {
-                var overallTimeout = Task.Delay(CouncilTimeout + TimeSpan.FromSeconds(2), ct);
-                var allTasks = Task.WhenAll(tasks);
-
-                var completed = await Task.WhenAny(allTasks, overallTimeout);
-
-                if (completed == allTasks)
+                // All completed within timeout
+                foreach (var vote in await allTasks)
                 {
-                    // All completed within timeout
-                    foreach (var vote in await allTasks)
+                    aggregator.Add(vote);
+                    onStatus?.Invoke($"  {vote.ModelName}: {(vote.TimedOut ? "TIMEOUT" : vote.Error ?? (vote.Result.Valid ? "✓ VALID" : "✗ INVALID"))} ({vote.ResponseTime.TotalSeconds:F1}s)");
+                }
+            }
+            else
+            {
+                // Overall timeout hit — collect whatever finished
+                onStatus?.Invoke("Council overall timeout — collecting partial results...");
+                foreach (var (modelInfo, task) in indexedTasks)
+                {
+                    if (task.IsCompletedSuccessfully)
                     {
+                        var vote = await task;
                         aggregator.Add(vote);
-                        onStatus?.Invoke($"  {vote.ModelName}: {(vote.TimedOut ? "TIMEOUT" : vote.Error ?? (vote.Result.Valid ? "✓ VALID" : "✗ INVALID"))} ({vote.ResponseTime.TotalSeconds:F1}s)");
+                        onStatus?.Invoke($"  {vote.ModelName}: {(vote.Result.Valid ? "✓" : "✗")} ({vote.ResponseTime.TotalSeconds:F1}s)");
                     }
-                }
-                else
-                {
-                    // Overall timeout hit — collect whatever finished
-                    onStatus?.Invoke("Council overall timeout — collecting partial results...");
-                    foreach (var (modelInfo, task) in indexedTasks)
+                    else
                     {
-                        if (task.IsCompletedSuccessfully)
-                        {
-                            var vote = await task;
-                            aggregator.Add(vote);
-                            onStatus?.Invoke($"  {vote.ModelName}: {(vote.Result.Valid ? "✓" : "✗")} ({vote.ResponseTime.TotalSeconds:F1}s)");
-                        }
-                        else
-                        {
-                            // Create a timeout vote for tasks that didn't finish
-                            // Safe: modelInfo is already associated with this task — no IndexOf needed
-                            aggregator.Add(new CouncilVote(
-                                modelInfo.Model, modelInfo.Weight,
-                                new VerificationResult(),
-                                CouncilTimeout, TimedOut: true));
-                        }
+                        // Create a timeout vote for tasks that didn't finish.
+                        // Safe: modelInfo is already associated with this task — no IndexOf needed.
+                        aggregator.Add(new CouncilVote(
+                            modelInfo.Model, modelInfo.Weight,
+                            new VerificationResult(),
+                            CouncilTimeout, TimedOut: true));
                     }
                 }
             }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-            {
-                // Timeout — degrade gracefully
-                onStatus?.Invoke("Council timeout — proceeding with available votes");
-            }
-
-            // Deadlock fallback: if zero valid responses, create a synthetic local vote
-            if (aggregator.ValidResponseCount == 0)
-            {
-                onStatus?.Invoke("Council deadlock — falling back to local model completion");
-                aggregator.Add(new CouncilVote(
-                    "local-fallback", 1.0,
-                    new VerificationResult(
-                        Valid: true,
-                        Corrections: [],
-                        Facts: [draft],
-                        Confidence: 0.3),
-                    TimeSpan.Zero));
-            }
-
-            return aggregator;
         }
-        finally
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            _rateLimiter.Dispose();
+            // Timeout — degrade gracefully
+            onStatus?.Invoke("Council timeout — proceeding with available votes");
         }
+
+        // Deadlock fallback: if zero valid responses, create a synthetic local vote
+        if (aggregator.ValidResponseCount == 0)
+        {
+            onStatus?.Invoke("Council deadlock — falling back to local model completion");
+            aggregator.Add(new CouncilVote(
+                "local-fallback", 1.0,
+                new VerificationResult(
+                    Valid: true,
+                    Corrections: [],
+                    Facts: [draft],
+                    Confidence: 0.3),
+                TimeSpan.Zero));
+        }
+
+        return aggregator;
     }
 
     /// <summary>
@@ -395,5 +390,12 @@ public sealed class AdaptiveVerificationEngine : IDisposable
             """;
     }
 
-    public void Dispose() => _client.Dispose();
+    // Fix (Bug introduced in PR #3): _rateLimiter must only be disposed here,
+    // NOT inside RunCouncilAsync's finally block. Disposing a class-level field
+    // in a per-call method causes ObjectDisposedException on every subsequent query.
+    public void Dispose()
+    {
+        _rateLimiter.Dispose();
+        _client.Dispose();
+    }
 }
