@@ -20,7 +20,10 @@ public enum QueryIntent
     Code,
     Creative,
     General,
-    Urgent
+    Urgent,
+    // Fix (Bug 1): Added Unknown so CreateFallbackReport can reference it
+    // without a compile error.
+    Unknown
 }
 
 // ── Ollama API contracts ───────────────────────────────────────────────────

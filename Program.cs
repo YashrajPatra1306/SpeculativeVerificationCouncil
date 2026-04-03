@@ -5,7 +5,7 @@ using SpeculativeVerificationCouncil;
 // ════════════════════════════════════════════════════════════════════════════
 // NativeAOT-safe entry point for the multi-model consensus engine.
 // Pipeline: Draft → Verify → Render with configurable strategies.
-// 
+//
 // Commands: !strict !weighted !adversarial !fast !auto !details !status exit
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -28,6 +28,10 @@ using var client = new OllamaClient(localUrl, cloudUrl, apiKey);
 using var engine = new AdaptiveVerificationEngine(client);
 
 // UX: Track detailed view preference
+// Fix (Bug 2): _showDetails is a top-level variable (not a field), so it
+// cannot be captured by the `static` HandleCommand method. The static
+// modifier has been removed from HandleCommand so it can close over this
+// variable correctly as a local function / top-level method.
 bool _showDetails = false;
 
 WriteColored($"Local: {localUrl} | Cloud: {cloudUrl}", ConsoleColor.DarkGray);
@@ -90,9 +94,10 @@ return;
 
 // ────────────────────────────────────────────────────────────────────────────
 //  HANDLE COMMAND - Process strategy selection and status commands
-//  UX: Added !details command to toggle verbose output
+//  Fix (Bug 2): Removed `static` so this local method can close over
+//  `_showDetails` declared in the top-level script scope.
 // ────────────────────────────────────────────────────────────────────────────
-static void HandleCommand(string command, AdaptiveVerificationEngine engine)
+void HandleCommand(string command, AdaptiveVerificationEngine engine)
 {
     switch (command.ToLowerInvariant())
     {
@@ -137,39 +142,34 @@ static void HandleCommand(string command, AdaptiveVerificationEngine engine)
 static void RenderReport(ConsensusReport report, bool showDetails = false)
 {
     Console.WriteLine();
-    
+
     // SECTION: MINIMAL OUTPUT (Default)
-    // Show only the final answer and confidence score for clean UX
     WriteColored("┌────────────────────────────────────────────────────────────┐", ConsoleColor.Cyan);
     WriteColored("│  ANSWER                                                    │", ConsoleColor.Cyan);
     WriteColored("└────────────────────────────────────────────────────────────┘", ConsoleColor.Cyan);
-    
+
     Console.ForegroundColor = ConsoleColor.White;
     Console.WriteLine($"\n{report.FinalResponse}\n");
     Console.ResetColor();
-    
-    // Confidence indicator with color coding
+
     var confColor = report.OverallConfidence >= 0.7 ? ConsoleColor.Green :
                     report.OverallConfidence >= 0.4 ? ConsoleColor.Yellow : ConsoleColor.Red;
     WriteColored($"Confidence: {report.OverallConfidence:P0}", confColor);
-    
+
     // SECTION: DETAILED OUTPUT (Only when requested via !details)
-    // Shows metrics, votes, costs, and technical details
     if (showDetails)
     {
         Console.WriteLine();
         WriteColored("┌────────────────────────────────────────────────────────────┐", ConsoleColor.DarkCyan);
         WriteColored("│  DETAILED METRICS                                          │", ConsoleColor.DarkCyan);
         WriteColored("└────────────────────────────────────────────────────────────┘", ConsoleColor.DarkCyan);
-        
-        // Performance metrics
+
         Console.WriteLine();
         WriteLabel("Strategy", report.StrategyUsed.ToString());
         WriteLabel("Time", $"{report.TotalTime.TotalSeconds:F2}s");
         if (report.ReflectionIterations > 0)
             WriteLabel("Reflections", $"{report.ReflectionIterations} iteration(s)", ConsoleColor.Magenta);
-        
-        // Vote breakdown
+
         Console.WriteLine();
         WriteColored("── Council Votes ────────────────────────────────────────────", ConsoleColor.DarkCyan);
         foreach (var vote in report.Votes)
@@ -186,8 +186,7 @@ static void RenderReport(ConsensusReport report, bool showDetails = false)
             Console.Write($" {vote.ResponseTime.TotalSeconds,5:F1}s  ");
             WriteColored(status, color);
         }
-        
-        // Dissent warnings
+
         if (report.DissentWarnings.Count > 0)
         {
             Console.WriteLine();
@@ -195,15 +194,13 @@ static void RenderReport(ConsensusReport report, bool showDetails = false)
             foreach (var warning in report.DissentWarnings)
                 WriteColored($"  ⚠ {warning}", ConsoleColor.Yellow);
         }
-        
-        // Cost info
+
         Console.WriteLine();
         var cost = report.Cost;
         WriteColored($"API calls: {cost.TotalApiCalls} | Est. cost: ${cost.EstimatedCostUsd:F4}", ConsoleColor.DarkGray);
     }
     else
     {
-        // Hint user about detailed view
         WriteColored("\n💡 Type !details to see metrics, votes, and costs", ConsoleColor.DarkGray);
     }
 }
